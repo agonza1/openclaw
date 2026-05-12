@@ -221,6 +221,7 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
   // Tracks accounts that were manually stopped so we don't auto-restart them.
   const manuallyStopped = new Set<string>();
   const recoveryStopTimedOut = new Set<string>();
+  const lifecycleGenerations = new Map<string, number>();
 
   const restartKey = (channelId: ChannelId, accountId: string) => `${channelId}:${accountId}`;
   const ensureChannelLog = (channelId: ChannelId): SubsystemLogger => {
@@ -352,8 +353,11 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
         continue;
       }
       store.runtimes.delete(id);
-      restartAttempts.delete(restartKey(channelId, id));
-      manuallyStopped.delete(restartKey(channelId, id));
+      const rKey = restartKey(channelId, id);
+      restartAttempts.delete(rKey);
+      manuallyStopped.delete(rKey);
+      recoveryStopTimedOut.delete(rKey);
+      lifecycleGenerations.delete(rKey);
     }
   };
 
@@ -487,6 +491,16 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
           if (!preserveRestartAttempts) {
             restartAttempts.delete(rKey);
           }
+          const lifecycleGeneration = (lifecycleGenerations.get(rKey) ?? 0) + 1;
+          lifecycleGenerations.set(rKey, lifecycleGeneration);
+          recoveryStopTimedOut.delete(rKey);
+          const isCurrentLifecycle = () => lifecycleGenerations.get(rKey) === lifecycleGeneration;
+          const setCurrentRuntime = (patch: ChannelAccountSnapshot) => {
+            if (!isCurrentLifecycle()) {
+              return getRuntime(channelId, id);
+            }
+            return setRuntime(channelId, id, patch);
+          };
           try {
             stopApprovalBootstrap = await measureStartup(
               `channels.${channelId}.approval-bootstrap`,
@@ -522,41 +536,41 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
                 abortSignal: abort.signal,
                 log,
                 getStatus: () => getRuntime(channelId, id),
-                setStatus: (next) => setRuntime(channelId, id, next),
+                setStatus: setCurrentRuntime,
                 ...(channelRuntimeForTask ? { channelRuntime: channelRuntimeForTask } : {}),
               }),
             ),
           );
           const trackedPromise = task
             .then(() => {
-              if (abort.signal.aborted || manuallyStopped.has(rKey)) {
+              if (!isCurrentLifecycle() || abort.signal.aborted || manuallyStopped.has(rKey)) {
                 return;
               }
               const message = "channel exited without an error";
-              setRuntime(channelId, id, { accountId: id, lastError: message });
+              setCurrentRuntime({ accountId: id, lastError: message });
               log.error?.(`[${id}] ${message}`);
             })
             .catch((err) => {
               const message = formatErrorMessage(err);
-              setRuntime(channelId, id, { accountId: id, lastError: message });
+              setCurrentRuntime({ accountId: id, lastError: message });
               log.error?.(`[${id}] channel exited: ${message}`);
             })
             .finally(async () => {
               await cleanupTaskScopedApprovalRuntime("channel cleanup failed");
-              setRuntime(channelId, id, {
+              setCurrentRuntime({
                 accountId: id,
                 running: false,
                 lastStopAt: Date.now(),
               });
             })
             .then(async () => {
-              if (manuallyStopped.has(rKey)) {
+              if (!isCurrentLifecycle() || manuallyStopped.has(rKey)) {
                 return;
               }
               const attempt = (restartAttempts.get(rKey) ?? 0) + 1;
               restartAttempts.set(rKey, attempt);
               if (attempt > MAX_RESTART_ATTEMPTS) {
-                setRuntime(channelId, id, {
+                setCurrentRuntime({
                   accountId: id,
                   restartPending: false,
                   reconnectAttempts: attempt,
@@ -568,7 +582,7 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
               log.info?.(
                 `[${id}] auto-restart attempt ${attempt}/${MAX_RESTART_ATTEMPTS} in ${Math.round(delayMs / 1000)}s`,
               );
-              setRuntime(channelId, id, {
+              setCurrentRuntime({
                 accountId: id,
                 restartPending: true,
                 reconnectAttempts: attempt,
@@ -661,6 +675,18 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
     const store = getStore(channelId);
     // Fast path: nothing running and no explicit plugin shutdown hook to run.
     if (!plugin?.gateway?.stopAccount && store.aborts.size === 0 && store.tasks.size === 0) {
+      if (manual && accountId) {
+        const rKey = restartKey(channelId, accountId);
+        manuallyStopped.add(rKey);
+        recoveryStopTimedOut.delete(rKey);
+        lifecycleGenerations.set(rKey, (lifecycleGenerations.get(rKey) ?? 0) + 1);
+        setRuntime(channelId, accountId, {
+          accountId,
+          running: false,
+          restartPending: false,
+          lastStopAt: Date.now(),
+        });
+      }
       return;
     }
     const cfg = getRuntimeConfig();
@@ -718,6 +744,13 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
           });
           if (!manual) {
             recoveryStopTimedOut.add(rKey);
+            lifecycleGenerations.set(rKey, (lifecycleGenerations.get(rKey) ?? 0) + 1);
+            if (store.tasks.get(id) === task) {
+              store.tasks.delete(id);
+            }
+            if (store.aborts.get(id) === abort) {
+              store.aborts.delete(id);
+            }
           }
           return;
         }
